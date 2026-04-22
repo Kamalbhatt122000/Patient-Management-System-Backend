@@ -3,18 +3,40 @@ Application configuration module.
 Handles Firebase initialization and app-level settings.
 """
 import os
+import json
 import firebase_admin
 from firebase_admin import credentials, firestore
 
-# Path to Firebase service account key
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SERVICE_ACCOUNT_KEY = os.path.join(
-    BASE_DIR,
-    "hospital-management-c603f-firebase-adminsdk-fbsvc-8ef915ee2b.json"
-)
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PARENT_DIR = os.path.dirname(CURRENT_DIR)
+
+CRED_FILENAME = "hospital-management-c603f-firebase-adminsdk-fbsvc-8ef915ee2b.json"
+
+def _find_credentials():
+    """Find Firebase credentials from env var, current dir, or parent dir."""
+    # 1. Environment variable with JSON string (best for Render)
+    cred_json = os.environ.get("FIREBASE_CREDENTIALS")
+    if cred_json:
+        return json.loads(cred_json)
+    # 2. Environment variable with file path
+    cred_path = os.environ.get("FIREBASE_CREDENTIALS_PATH")
+    if cred_path and os.path.exists(cred_path):
+        return cred_path
+    # 3. Same directory as this file (backend/)
+    local = os.path.join(CURRENT_DIR, CRED_FILENAME)
+    if os.path.exists(local):
+        return local
+    # 4. Parent directory
+    parent = os.path.join(PARENT_DIR, CRED_FILENAME)
+    if os.path.exists(parent):
+        return parent
+    raise FileNotFoundError(
+        f"Firebase credentials not found. Set FIREBASE_CREDENTIALS env var "
+        f"or place {CRED_FILENAME} in the backend directory."
+    )
 
 # Upload folder for medical reports
-UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads", "reports")
+UPLOAD_FOLDER = os.path.join(CURRENT_DIR, "uploads", "reports")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 ALLOWED_EXTENSIONS = {"pdf", "png", "jpg", "jpeg", "gif", "bmp", "webp"}
@@ -23,7 +45,11 @@ MAX_CONTENT_LENGTH = 16 * 1024 * 1024  # 16 MB
 def init_firebase():
     """Initialize Firebase Admin SDK (idempotent)."""
     if not firebase_admin._apps:
-        cred = credentials.Certificate(SERVICE_ACCOUNT_KEY)
+        cred_source = _find_credentials()
+        if isinstance(cred_source, dict):
+            cred = credentials.Certificate(cred_source)
+        else:
+            cred = credentials.Certificate(cred_source)
         firebase_admin.initialize_app(cred)
     return firestore.client()
 
