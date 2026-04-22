@@ -4,6 +4,7 @@ Handles Firebase initialization and app-level settings.
 """
 import os
 import json
+import base64
 import firebase_admin
 from firebase_admin import credentials, firestore
 
@@ -14,10 +15,20 @@ CRED_FILENAME = "hospital-management-c603f-firebase-adminsdk-fbsvc-8ef915ee2b.js
 
 def _find_credentials():
     """Find Firebase credentials from env var, current dir, or parent dir."""
-    # 1. Environment variable with JSON string (best for Render)
+    # 1. Environment variable (supports raw JSON or base64-encoded JSON)
     cred_json = os.environ.get("FIREBASE_CREDENTIALS")
     if cred_json:
-        return json.loads(cred_json)
+        # Try base64 first
+        try:
+            decoded = base64.b64decode(cred_json).decode("utf-8")
+            return json.loads(decoded)
+        except Exception:
+            pass
+        # Try raw JSON
+        try:
+            return json.loads(cred_json)
+        except json.JSONDecodeError:
+            pass
     # 2. Environment variable with file path
     cred_path = os.environ.get("FIREBASE_CREDENTIALS_PATH")
     if cred_path and os.path.exists(cred_path):
