@@ -223,6 +223,19 @@ def upload_report():
     patient_data = patient_doc.to_dict()
     patient_sf_id = patient_data.get("salesforce_id")
 
+    # Auto-create patient in Salesforce if they don't have an SF ID yet
+    if sf and not patient_sf_id:
+        try:
+            from routes.patients import _sync_patient_to_salesforce
+            patient_sf_id = _sync_patient_to_salesforce(sf, patient_data)
+            if patient_sf_id:
+                db.collection("patients").document(patient_id).update({
+                    "salesforce_id": patient_sf_id
+                })
+                print(f"✅ Auto-synced patient {patient_id} to Salesforce: {patient_sf_id}")
+        except Exception as e:
+            print(f"⚠️  Auto-sync patient to SF failed: {e}")
+
     if sf and patient_sf_id:
         sf_result = _upload_file_to_salesforce(sf, file_bytes, secure_filename(file.filename), report_name)
         if sf_result:
@@ -238,7 +251,7 @@ def upload_report():
     else:
         report["sf_synced"] = False
         if not patient_sf_id:
-            print(f"⚠️  Patient {patient_id} has no Salesforce ID; file not synced to SF")
+            print(f"⚠️  Patient {patient_id} could not be synced to Salesforce")
 
     # Save metadata to Firebase
     db.collection("reports").document(report_id).set(report)
