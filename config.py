@@ -7,6 +7,16 @@ import json
 import base64
 import firebase_admin
 from firebase_admin import credentials, firestore
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
+
+def init_salesforce():
+    """Initialize and return the Salesforce client."""
+    from salesforce_client import get_salesforce_client
+    return get_salesforce_client()
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PARENT_DIR = os.path.dirname(CURRENT_DIR)

@@ -4,12 +4,13 @@ Registers all blueprints and configures middleware.
 """
 from flask import Flask
 from flask_cors import CORS
-from config import init_firebase, UPLOAD_FOLDER, MAX_CONTENT_LENGTH
+from config import init_firebase, init_salesforce, UPLOAD_FOLDER, MAX_CONTENT_LENGTH
 
 # Import route blueprints
 from routes.patients import patients_bp
 from routes.appointments import appointments_bp
 from routes.reports import reports_bp
+from routes.doctors import doctors_bp
 
 def create_app():
     """Application factory."""
@@ -26,15 +27,30 @@ def create_app():
     db = init_firebase()
     app.config["FIRESTORE_DB"] = db
     
+    # --- Salesforce ---
+    try:
+        sf = init_salesforce()
+        app.config["SF_CLIENT"] = sf
+        print("✅ Salesforce integration enabled")
+    except Exception as e:
+        app.config["SF_CLIENT"] = None
+        print(f"⚠️  Salesforce init failed (app will still run): {e}")
+    
     # --- Register Blueprints ---
     app.register_blueprint(patients_bp, url_prefix="/api/patients")
     app.register_blueprint(appointments_bp, url_prefix="/api/appointments")
     app.register_blueprint(reports_bp, url_prefix="/api/reports")
+    app.register_blueprint(doctors_bp, url_prefix="/api/doctors")
     
     # --- Health Check ---
     @app.route("/api/health")
     def health():
-        return {"status": "healthy", "service": "Patient Management System API"}
+        sf_status = "connected" if app.config.get("SF_CLIENT") else "disconnected"
+        return {
+            "status": "healthy",
+            "service": "Patient Management System API",
+            "salesforce": sf_status,
+        }
     
     # --- Error Handlers ---
     @app.errorhandler(400)
