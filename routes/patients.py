@@ -1,13 +1,23 @@
 """
 Patient routes – CRUD operations with triage logic.
 Syncs data to Salesforce Patient__c object.
+
+Long free-text fields (currently Symptoms__c) are summarised via Gemini before
+sync when the input exceeds the Salesforce field length. The full text always
+lives in Firestore; only the SF mirror carries the summary.
 """
 import re
 import uuid
 from datetime import datetime, timezone
 from flask import Blueprint, request, jsonify, current_app
 
+from gemini_client import SummarizationError, summarize_to_length
+from sf_schema import get_field_length
+
 patients_bp = Blueprint("patients", __name__)
+
+SYMPTOMS_SF_FIELD = "Symptoms__c"
+SYMPTOMS_SF_OBJECT = "Patient__c"
 
 # --------------- helpers ---------------
 
@@ -46,13 +56,47 @@ def _validate_patient(data: dict) -> list[str]:
     return errors
 
 
-def _sync_patient_to_salesforce(sf, patient_data: dict) -> str | None:
+def _prepare_symptoms_for_sf(sf, symptoms: str) -> str:
+    """
+    Return the symptoms string that should be written to Salesforce.
+
+    Looks up the live Symptoms__c field length via describe (cached), and if the
+    input is longer, asks Gemini to produce a clinically-faithful summary that
+    fits. Raises SummarizationError if the field length cannot be determined or
+    Gemini cannot produce a summary.
+    """
+    if not symptoms:
+        return symptoms
+
+    try:
+        max_len = get_field_length(sf, SYMPTOMS_SF_OBJECT, SYMPTOMS_SF_FIELD)
+    except Exception as e:
+        raise SummarizationError(
+            f"Could not read Salesforce {SYMPTOMS_SF_OBJECT}.{SYMPTOMS_SF_FIELD} length: {e}"
+        ) from e
+
+    if max_len is None or len(symptoms) <= max_len:
+        return symptoms
+
+    return summarize_to_length(symptoms, max_len)
+
+
+def _sync_patient_to_salesforce(sf, patient_data: dict, symptoms_for_sf: str | None = None) -> str | None:
     """
     Create a Patient__c record in Salesforce.
+
+    `symptoms_for_sf`, when provided, overrides the symptoms value sent to
+    Salesforce (used to push a pre-computed Gemini summary). When None, the
+    full text from `patient_data["symptoms"]` is sent as-is — callers must
+    ensure it already fits the SF field length.
+
     Returns the Salesforce record ID on success, None on failure.
     """
     if not sf:
         return None
+    sf_symptoms = (
+        symptoms_for_sf if symptoms_for_sf is not None else patient_data.get("symptoms", "")
+    )
     try:
         result = sf.Patient__c.create({
             "Name": patient_data["first_name"],
@@ -61,7 +105,7 @@ def _sync_patient_to_salesforce(sf, patient_data: dict) -> str | None:
             "Gender__c": patient_data["gender"],
             "Paitent_Email__c": patient_data["email"],
             "Address__c": patient_data.get("address", ""),
-            "Symptoms__c": patient_data.get("symptoms", ""),
+            "Symptoms__c": sf_symptoms,
         })
         sf_id = result.get("id")
         print(f"✅ Patient synced to Salesforce: {sf_id}")
@@ -89,10 +133,21 @@ def register_patient():
     if existing:
         return jsonify({"error": "A patient with this email already exists."}), 409
 
-    priority = _calculate_priority(
-        data.get("symptoms", ""),
-        data.get("duration_days"),
-    )
+    symptoms_full = data.get("symptoms", "").strip()
+
+    # Pre-compute the SF-safe symptoms BEFORE any Firestore write so a Gemini
+    # failure leaves no partial state.
+    symptoms_for_sf: str | None = None
+    if sf and symptoms_full:
+        try:
+            symptoms_for_sf = _prepare_symptoms_for_sf(sf, symptoms_full)
+        except SummarizationError as e:
+            return jsonify({
+                "error": "Could not summarise symptoms for Salesforce.",
+                "details": str(e),
+            }), 503
+
+    priority = _calculate_priority(symptoms_full, data.get("duration_days"))
 
     patient_id = str(uuid.uuid4())
     patient = {
@@ -104,18 +159,20 @@ def register_patient():
         "email": data["email"].strip().lower(),
         "phone": data.get("phone", "").strip(),
         "address": data.get("address", "").strip(),
-        "symptoms": data.get("symptoms", "").strip(),
+        "symptoms": symptoms_full,
         "duration_days": data.get("duration_days"),
         "priority": priority,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
+    if symptoms_for_sf is not None and symptoms_for_sf != symptoms_full:
+        patient["symptoms_summary"] = symptoms_for_sf
 
     # 1. Save to Firebase
     db.collection("patients").document(patient_id).set(patient)
 
     # 2. Sync to Salesforce
-    sf_id = _sync_patient_to_salesforce(sf, patient)
+    sf_id = _sync_patient_to_salesforce(sf, patient, symptoms_for_sf=symptoms_for_sf)
     if sf_id:
         patient["salesforce_id"] = sf_id
         db.collection("patients").document(patient_id).update({"salesforce_id": sf_id})
@@ -159,18 +216,36 @@ def update_patient(patient_id):
     ]
     updates = {k: v for k, v in data.items() if k in allowed_fields and v is not None}
 
+    current_data = doc.to_dict()
+    sf_id = current_data.get("salesforce_id")
+
+    # If symptoms are being changed, summarise BEFORE any Firestore write so a
+    # Gemini failure short-circuits cleanly with a 503.
+    symptoms_for_sf: str | None = None
+    if "symptoms" in updates and sf and sf_id:
+        try:
+            symptoms_for_sf = _prepare_symptoms_for_sf(sf, updates["symptoms"])
+        except SummarizationError as e:
+            return jsonify({
+                "error": "Could not summarise symptoms for Salesforce.",
+                "details": str(e),
+            }), 503
+
+        if symptoms_for_sf != updates["symptoms"]:
+            updates["symptoms_summary"] = symptoms_for_sf
+        else:
+            # Symptoms now fit — clear any stale summary on the doc.
+            updates["symptoms_summary"] = None
+
     if "symptoms" in updates or "duration_days" in updates:
-        current = doc.to_dict()
-        symptoms = updates.get("symptoms", current.get("symptoms", ""))
-        duration = updates.get("duration_days", current.get("duration_days"))
+        symptoms = updates.get("symptoms", current_data.get("symptoms", ""))
+        duration = updates.get("duration_days", current_data.get("duration_days"))
         updates["priority"] = _calculate_priority(symptoms, duration)
 
     updates["updated_at"] = datetime.now(timezone.utc).isoformat()
     doc_ref.update(updates)
 
     # Sync updates to Salesforce
-    current_data = doc.to_dict()
-    sf_id = current_data.get("salesforce_id")
     if sf and sf_id:
         try:
             sf_updates = {}
@@ -187,7 +262,9 @@ def update_patient(patient_id):
             if "address" in updates:
                 sf_updates["Address__c"] = updates["address"]
             if "symptoms" in updates:
-                sf_updates["Symptoms__c"] = updates["symptoms"]
+                sf_updates["Symptoms__c"] = (
+                    symptoms_for_sf if symptoms_for_sf is not None else updates["symptoms"]
+                )
             if sf_updates:
                 sf.Patient__c.update(sf_id, sf_updates)
                 print(f"✅ Salesforce patient {sf_id} updated")

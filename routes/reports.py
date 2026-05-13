@@ -226,13 +226,27 @@ def upload_report():
     # Auto-create patient in Salesforce if they don't have an SF ID yet
     if sf and not patient_sf_id:
         try:
-            from routes.patients import _sync_patient_to_salesforce
-            patient_sf_id = _sync_patient_to_salesforce(sf, patient_data)
-            if patient_sf_id:
-                db.collection("patients").document(patient_id).update({
-                    "salesforce_id": patient_sf_id
-                })
-                print(f"✅ Auto-synced patient {patient_id} to Salesforce: {patient_sf_id}")
+            from routes.patients import _sync_patient_to_salesforce, _prepare_symptoms_for_sf
+            from gemini_client import SummarizationError
+
+            try:
+                symptoms_for_sf = _prepare_symptoms_for_sf(sf, patient_data.get("symptoms", ""))
+            except SummarizationError as se:
+                # Best-effort during file upload: skip SF sync rather than fail
+                # the upload itself. The file still lands locally + in Firebase.
+                print(f"⚠️  Skipping SF auto-sync — symptom summarisation failed: {se}")
+                symptoms_for_sf = None
+
+            if symptoms_for_sf is not None:
+                patient_sf_id = _sync_patient_to_salesforce(
+                    sf, patient_data, symptoms_for_sf=symptoms_for_sf
+                )
+                if patient_sf_id:
+                    update_fields = {"salesforce_id": patient_sf_id}
+                    if symptoms_for_sf != patient_data.get("symptoms", ""):
+                        update_fields["symptoms_summary"] = symptoms_for_sf
+                    db.collection("patients").document(patient_id).update(update_fields)
+                    print(f"✅ Auto-synced patient {patient_id} to Salesforce: {patient_sf_id}")
         except Exception as e:
             print(f"⚠️  Auto-sync patient to SF failed: {e}")
 
